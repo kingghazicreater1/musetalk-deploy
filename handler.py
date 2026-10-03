@@ -105,6 +105,7 @@ async def generate(req: GenerateRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
