@@ -25,7 +25,7 @@ RUN pip install --no-cache-dir chumpy --no-build-isolation
 
 RUN pip install --no-cache-dir "mmdet==3.1.0" "mmpose==1.1.0"
 
-RUN pip install --no-cache-dir fastapi uvicorn boto3 python-multipart
+RUN pip install --no-cache-dir fastapi uvicorn boto3 python-multipart runpod
 
 COPY MuseTalk /workspace/MuseTalk
 

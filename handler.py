@@ -4,11 +4,7 @@ import subprocess
 from pathlib import Path
 
 import boto3
-import uvicorn
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-
-app = FastAPI()
+import runpod
 
 R2_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
 R2_ACCESS_KEY = os.environ["R2_ACCESS_KEY"]
@@ -22,12 +18,6 @@ s3 = boto3.client(
     aws_secret_access_key=R2_SECRET_KEY,
     region_name="auto",
 )
-
-
-class GenerateRequest(BaseModel):
-    video_url: str
-    audio_url: str
-    job_id: str
 
 
 def download_from_r2(r2_url: str, local_path: str):
@@ -44,9 +34,12 @@ def upload_to_r2(local_path: str, r2_key: str) -> str:
     return f"https://{R2_BUCKET}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com/{r2_key}"
 
 
-@app.post("/generate")
-async def generate(req: GenerateRequest):
-    job_id = req.job_id
+def handler(job):
+    job_input = job["input"]
+    video_url = job_input["video_url"]
+    audio_url = job_input["audio_url"]
+    job_id = job_input["job_id"]
+
     work_dir = Path(f"/root/mt-results/{job_id}")
     input_dir = work_dir / "input"
     output_dir = work_dir / "output"
@@ -58,8 +51,8 @@ async def generate(req: GenerateRequest):
 
         video_local = input_dir / "video.mp4"
         audio_local = input_dir / "audio.wav"
-        download_from_r2(req.video_url, str(video_local))
-        download_from_r2(req.audio_url, str(audio_local))
+        download_from_r2(video_url, str(video_local))
+        download_from_r2(audio_url, str(audio_local))
 
         config_dir = Path("/workspace/MuseTalk/configs/inference")
         config_dir.mkdir(parents=True, exist_ok=True)
@@ -102,14 +95,7 @@ async def generate(req: GenerateRequest):
 
     except Exception as e:
         shutil.rmtree(work_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise
 
 
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+runpod.serverless.start({"handler": handler})
