@@ -1,0 +1,13 @@
+# MuseTalk folder ke andar yeh exclude karo
+MuseTalk/models
+MuseTalk/results
+MuseTalk/.git
+MuseTalk/__pycache__
+MuseTalk/**/__pycache__
+MuseTalk/*.pyc
+
+# Root mein yeh exclude karo
+MuseTalk.tar.gz
+chunk_*.txt
+df_chunk_*.txt
+*.b64

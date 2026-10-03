@@ -1,0 +1,39 @@
+FROM runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04
+
+RUN apt-get update && apt-get install -y \
+    ffmpeg git wget curl libgl1-mesa-glx libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m venv /root/mt-env
+ENV PATH="/root/mt-env/bin:$PATH"
+ENV PIP_CACHE_DIR=/root/.pipcache
+
+RUN pip install --no-cache-dir \
+    torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 \
+    --index-url https://download.pytorch.org/whl/cu118
+
+COPY requirements.txt /tmp/requirements.txt
+RUN printf "torch==2.0.1\ntorchvision==0.15.2\ntorchaudio==2.0.2\nnumpy==1.23.5\n" > /tmp/constraints.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt -c /tmp/constraints.txt
+
+RUN pip install --no-cache-dir mmengine
+RUN pip install --no-cache-dir "mmcv==2.0.1" \
+    -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.0.0/index.html
+
+RUN pip install --no-cache-dir "setuptools<70" wheel
+RUN pip install --no-cache-dir chumpy --no-build-isolation
+
+RUN pip install --no-cache-dir "mmdet==3.1.0" "mmpose==1.1.0"
+
+RUN pip install --no-cache-dir fastapi uvicorn boto3 python-multipart
+
+COPY MuseTalk /workspace/MuseTalk
+
+RUN rm -rf /workspace/MuseTalk/models && \
+    ln -s /workspace/musetalk-models /workspace/MuseTalk/models
+
+COPY handler.py /handler.py
+
+WORKDIR /workspace/MuseTalk
+
+CMD ["python", "/handler.py"]
