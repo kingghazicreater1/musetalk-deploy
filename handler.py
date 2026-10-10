@@ -33,7 +33,30 @@ def upload_to_r2(local_path: str, r2_key: str) -> str:
     s3.upload_file(local_path, R2_BUCKET, r2_key)
     return f"https://{R2_BUCKET}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com/{r2_key}"
 
+def _ensure_models():
+    target = Path("/workspace/MuseTalk/models")
+    need = Path("musetalkV15") / "unet.pth"
+    if (target / need).exists():
+        return
+    for base in ["/runpod-volume/musetalk-models", "/runpod-volume/models",
+                 "/runpod-volume/MuseTalk/models", "/runpod-volume"]:
+        if (Path(base) / need).exists():
+            if target.is_symlink():
+                target.unlink()
+            elif target.exists():
+                shutil.rmtree(target)
+            target.symlink_to(base)
+            return
+    raise RuntimeError("MuseTalk weights nahi mile (musetalkV15/unet.pth)")
 
+
+def _debug_listing():
+    out = {}
+    for p in ["/runpod-volume", "/workspace", "/workspace/MuseTalk/models", "/workspace/musetalk-models"]:
+        pp = Path(p)
+        out[p] = sorted(x.name for x in pp.iterdir())[:50] if pp.exists() else "MISSING"
+    out["musetalk_pkg"] = sorted(x.name for x in Path("/workspace/MuseTalk/musetalk").iterdir())
+    return out
 def handler(job):
     job_input = job["input"]
     video_url = job_input["video_url"]
