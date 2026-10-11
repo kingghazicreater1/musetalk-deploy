@@ -98,7 +98,8 @@ async def generate(req: GenerateRequest):
         shutil.rmtree(work_dir, ignore_errors=True)
         config_path.unlink(missing_ok=True)
 
-        return {"r2_url": r2_url, "job_id": job_id, "status": "done"}
+        return {"r2_url": r2_url, "job_id": job_id, "status": "done",
+        "log": (result.stderr or "")[-1500:]}
 
     except Exception as e:
         shutil.rmtree(work_dir, ignore_errors=True)
