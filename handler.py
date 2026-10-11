@@ -53,12 +53,27 @@ def _ensure_models():
 
 def _debug_listing():
     out = {}
-    for p in ["/runpod-volume", "/workspace", "/workspace/MuseTalk/models", "/workspace/musetalk-models"]:
+    for p in ["/runpod-volume", "/workspace", "/workspace/MuseTalk/models"]:
         pp = Path(p)
         out[p] = sorted(x.name for x in pp.iterdir())[:50] if pp.exists() else "MISSING"
     pkg = Path("/workspace/MuseTalk/musetalk")
     out["musetalk_pkg"] = sorted(x.name for x in pkg.iterdir()) if pkg.exists() else "MISSING"
     return out
+
+
+def _probe(path, stream):
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", stream, "-count_frames",
+         "-show_entries", "stream=nb_read_frames,duration", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def _frames(path):
+    try:
+        return int(_probe(path, "v:0").split(",")[-1])
+    except Exception:
+        return -1
 
 
 def handler(job):
@@ -111,9 +126,19 @@ def handler(job):
         if not mp4_files:
             raise RuntimeError("No MP4 output found")
 
+        out_mp4 = mp4_files[0]
+        frames_in = _frames(video_local)
+        frames_out = _frames(out_mp4)
+
         r2_key = f"musetalk/{job_id}.mp4"
-        r2_url = upload_to_r2(str(mp4_files[0]), r2_key)
-        return {"r2_url": r2_url, "job_id": job_id, "status": "done"}
+        r2_url = upload_to_r2(str(out_mp4), r2_key)
+
+        return {
+            "r2_url": r2_url, "job_id": job_id, "status": "done",
+            "frames_in": frames_in, "frames_out": frames_out,
+            "frames_ok": frames_in > 0 and frames_out >= 0.95 * frames_in,
+            "log": (result.stderr or "")[-1500:] + "\n--stdout--\n" + (result.stdout or "")[-700:],
+        }
 
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
