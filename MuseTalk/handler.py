@@ -4,11 +4,7 @@ import subprocess
 from pathlib import Path
 
 import boto3
-import uvicorn
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-
-app = FastAPI()
+import runpod
 
 R2_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
 R2_ACCESS_KEY = os.environ["R2_ACCESS_KEY"]
@@ -24,15 +20,9 @@ s3 = boto3.client(
 )
 
 
-class GenerateRequest(BaseModel):
-    video_url: str
-    audio_url: str
-    job_id: str
-
-
 def download_from_r2(r2_url: str, local_path: str):
     import requests
-    r = requests.get(r2_url, stream=True)
+    r = requests.get(r2_url, stream=True, timeout=120)
     r.raise_for_status()
     with open(local_path, "wb") as f:
         for chunk in r.iter_content(chunk_size=8192):
@@ -44,12 +34,63 @@ def upload_to_r2(local_path: str, r2_key: str) -> str:
     return f"https://{R2_BUCKET}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com/{r2_key}"
 
 
-@app.post("/generate")
-async def generate(req: GenerateRequest):
-    job_id = req.job_id
+def _ensure_models():
+    target = Path("/workspace/MuseTalk/models")
+    need = Path("musetalkV15") / "unet.pth"
+    if (target / need).exists():
+        return
+    for base in ["/runpod-volume/musetalk-models", "/runpod-volume/models",
+                 "/runpod-volume/MuseTalk/models", "/runpod-volume"]:
+        if (Path(base) / need).exists():
+            if target.is_symlink():
+                target.unlink()
+            elif target.exists():
+                shutil.rmtree(target)
+            target.symlink_to(base)
+            return
+    raise RuntimeError("MuseTalk weights nahi mile (musetalkV15/unet.pth)")
+
+
+def _debug_listing():
+    out = {}
+    for p in ["/runpod-volume", "/workspace", "/workspace/MuseTalk/models"]:
+        pp = Path(p)
+        out[p] = sorted(x.name for x in pp.iterdir())[:50] if pp.exists() else "MISSING"
+    pkg = Path("/workspace/MuseTalk/musetalk")
+    out["musetalk_pkg"] = sorted(x.name for x in pkg.iterdir()) if pkg.exists() else "MISSING"
+    return out
+
+
+def _probe(path, stream):
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", stream, "-count_frames",
+         "-show_entries", "stream=nb_read_frames,duration", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def _frames(path):
+    try:
+        return int(_probe(path, "v:0").split(",")[-1])
+    except Exception:
+        return -1
+
+
+def handler(job):
+    job_input = job["input"]
+    if job_input.get("debug"):
+        return _debug_listing()
+
+    _ensure_models()
+
+    video_url = job_input["video_url"]
+    audio_url = job_input["audio_url"]
+    job_id = job_input["job_id"]
+
     work_dir = Path(f"/root/mt-results/{job_id}")
     input_dir = work_dir / "input"
     output_dir = work_dir / "output"
+    config_path = Path(f"/workspace/MuseTalk/configs/inference/dynamic_{job_id}.yaml")
 
     try:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -58,12 +99,10 @@ async def generate(req: GenerateRequest):
 
         video_local = input_dir / "video.mp4"
         audio_local = input_dir / "audio.wav"
-        download_from_r2(req.video_url, str(video_local))
-        download_from_r2(req.audio_url, str(audio_local))
+        download_from_r2(video_url, str(video_local))
+        download_from_r2(audio_url, str(audio_local))
 
-        config_dir = Path("/workspace/MuseTalk/configs/inference")
-        config_dir.mkdir(parents=True, exist_ok=True)
-        config_path = config_dir / f"dynamic_{job_id}.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(
             f"task_0:\n  video_path: {video_local}\n  audio_path: {audio_local}\n"
         )
@@ -77,13 +116,9 @@ async def generate(req: GenerateRequest):
             "--version", "v15",
         ]
         result = subprocess.run(
-            cmd,
-            cwd="/workspace/MuseTalk",
-            capture_output=True,
-            text=True,
-            timeout=3600,
+            cmd, cwd="/workspace/MuseTalk",
+            capture_output=True, text=True, timeout=3600,
         )
-
         if result.returncode != 0:
             raise RuntimeError(f"Inference failed:\n{result.stderr[-2000:]}")
 
@@ -91,25 +126,23 @@ async def generate(req: GenerateRequest):
         if not mp4_files:
             raise RuntimeError("No MP4 output found")
 
-        final_mp4 = mp4_files[0]
-        r2_key = f"musetalk/{job_id}.mp4"
-        r2_url = upload_to_r2(str(final_mp4), r2_key)
+        out_mp4 = mp4_files[0]
+        frames_in = _frames(video_local)
+        frames_out = _frames(out_mp4)
 
+        r2_key = f"musetalk/{job_id}.mp4"
+        r2_url = upload_to_r2(str(out_mp4), r2_key)
+
+        return {
+            "r2_url": r2_url, "job_id": job_id, "status": "done",
+            "frames_in": frames_in, "frames_out": frames_out,
+            "frames_ok": frames_in > 0 and frames_out >= 0.95 * frames_in,
+            "log": (result.stderr or "")[-1500:] + "\n--stdout--\n" + (result.stdout or "")[-700:],
+        }
+
+    finally:
         shutil.rmtree(work_dir, ignore_errors=True)
         config_path.unlink(missing_ok=True)
 
-        return {"r2_url": r2_url, "job_id": job_id, "status": "done",
-        "log": (result.stderr or "")[-1500:]}
 
-    except Exception as e:
-        shutil.rmtree(work_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+runpod.serverless.start({"handler": handler})
