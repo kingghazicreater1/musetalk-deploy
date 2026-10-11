@@ -37,12 +37,12 @@ def main(args):
         os.environ["PATH"] = f"{args.ffmpeg_path}{path_separator}{os.environ['PATH']}"
         if not fast_check_ffmpeg():
             print("Warning: Unable to find ffmpeg, please ensure ffmpeg is properly installed")
-    
+
     # Set computing device
     device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
     # Load model weights
     vae, unet, pe = load_all_model(
-        unet_model_path=args.unet_model_path, 
+        unet_model_path=args.unet_model_path,
         vae_type=args.vae_type,
         unet_config=args.unet_config,
         device=device
@@ -54,19 +54,19 @@ def main(args):
         pe = pe.half()
         vae.vae = vae.vae.half()
         unet.model = unet.model.half()
-    
+
     # Move models to specified device
     pe = pe.to(device)
     vae.vae = vae.vae.to(device)
     unet.model = unet.model.to(device)
-        
+
     # Initialize audio processor and Whisper model
     audio_processor = AudioProcessor(feature_extractor_path=args.whisper_dir)
     weight_dtype = unet.model.dtype
     whisper = WhisperModel.from_pretrained(args.whisper_dir)
     whisper = whisper.to(device=device, dtype=weight_dtype).eval()
     whisper.requires_grad_(False)
-    
+
     # Initialize face parser with configurable parameters based on version
     if args.version == "v15":
         fp = FaceParsing(
@@ -75,11 +75,11 @@ def main(args):
         )
     else:  # v1
         fp = FaceParsing()
-    
+
     # Load inference configuration
     inference_config = OmegaConf.load(args.inference_config)
     print("Loaded inference config:", inference_config)
-    
+
     # Process each task
     for task_id in inference_config:
         try:
@@ -88,34 +88,34 @@ def main(args):
             audio_path = inference_config[task_id]["audio_path"]
             if "result_name" in inference_config[task_id]:
                 args.output_vid_name = inference_config[task_id]["result_name"]
-            
+
             # Set bbox_shift based on version
             if args.version == "v15":
                 bbox_shift = 0  # v15 uses fixed bbox_shift
             else:
                 bbox_shift = inference_config[task_id].get("bbox_shift", args.bbox_shift)  # v1 uses config or default
-            
+
             # Set output paths
             input_basename = os.path.basename(video_path).split('.')[0]
             audio_basename = os.path.basename(audio_path).split('.')[0]
             output_basename = f"{input_basename}_{audio_basename}"
-            
+
             # Create temporary directories
             temp_dir = os.path.join(args.result_dir, f"{args.version}")
             os.makedirs(temp_dir, exist_ok=True)
-            
+
             # Set result save paths
             result_img_save_path = os.path.join(temp_dir, output_basename)
             crop_coord_save_path = os.path.join(args.result_dir, "../", input_basename+".pkl")
             os.makedirs(result_img_save_path, exist_ok=True)
-            
+
             # Set output video paths
             if args.output_vid_name is None:
                 output_vid_name = os.path.join(temp_dir, output_basename + ".mp4")
             else:
                 output_vid_name = os.path.join(temp_dir, args.output_vid_name)
             output_vid_name_concat = os.path.join(temp_dir, output_basename + "_concat.mp4")
-            
+
             # Extract frames from source video
             if get_file_type(video_path) == "video":
                 save_dir_full = os.path.join(temp_dir, input_basename)
@@ -137,16 +137,16 @@ def main(args):
             # Extract audio features
             whisper_input_features, librosa_length = audio_processor.get_audio_feature(audio_path)
             whisper_chunks = audio_processor.get_whisper_chunk(
-                whisper_input_features, 
-                device, 
-                weight_dtype, 
-                whisper, 
+                whisper_input_features,
+                device,
+                weight_dtype,
+                whisper,
                 librosa_length,
                 fps=fps,
                 audio_padding_length_left=args.audio_padding_length_left,
                 audio_padding_length_right=args.audio_padding_length_right,
             )
-            
+
             # Preprocess input images
             if os.path.exists(crop_coord_save_path) and args.use_saved_coord:
                 print("Using saved coordinates")
@@ -158,14 +158,17 @@ def main(args):
                 coord_list, frame_list = get_landmark_and_bbox(input_img_list, bbox_shift)
                 with open(crop_coord_save_path, 'wb') as f:
                     pickle.dump(coord_list, f)
-            
-            print(f"Number of frames: {len(frame_list)}")         
-            
+
+            print(f"Number of frames: {len(frame_list)}")
+
             # Process each frame
             input_latent_list = []
-            for bbox, frame in zip(coord_list, frame_list):
+            valid_idx = []
+            for k_idx, (bbox, frame) in enumerate(zip(coord_list, frame_list)):
                 if bbox == coord_placeholder:
+                    input_latent_list.append(None)
                     continue
+                valid_idx.append(k_idx)
                 x1, y1, x2, y2 = bbox
                 if args.version == "v15":
                     y2 = y2 + args.extra_margin
@@ -174,12 +177,19 @@ def main(args):
                 crop_frame = cv2.resize(crop_frame, (256,256), interpolation=cv2.INTER_LANCZOS4)
                 latents = vae.get_latents_for_unet(crop_frame)
                 input_latent_list.append(latents)
-        
+
+            if not valid_idx:
+                raise RuntimeError("NO_FACE: no face detected in any frame")
+            for k_idx in range(len(input_latent_list)):
+                if input_latent_list[k_idx] is None:
+                    near = min(valid_idx, key=lambda j: abs(j - k_idx))
+                    input_latent_list[k_idx] = input_latent_list[near]
+
             # Smooth first and last frames
             frame_list_cycle = frame_list + frame_list[::-1]
             coord_list_cycle = coord_list + coord_list[::-1]
             input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
-            
+
             # Batch inference
             print("Starting inference")
             video_num = len(whisper_chunks)
@@ -191,25 +201,28 @@ def main(args):
                 delay_frame=0,
                 device=device,
             )
-            
+
             res_frame_list = []
             total = int(np.ceil(float(video_num) / batch_size))
-            
+
             # Execute inference
             for i, (whisper_batch, latent_batch) in enumerate(tqdm(gen, total=total)):
                 audio_feature_batch = pe(whisper_batch)
                 latent_batch = latent_batch.to(dtype=unet.model.dtype)
-                
+
                 pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
                 recon = vae.decode_latents(pred_latents)
                 for res_frame in recon:
                     res_frame_list.append(res_frame)
-            
+
             # Pad generated images to original video size
             print("Padding generated images to original video size")
             for i, res_frame in enumerate(tqdm(res_frame_list)):
                 bbox = coord_list_cycle[i%(len(coord_list_cycle))]
                 ori_frame = copy.deepcopy(frame_list_cycle[i%(len(frame_list_cycle))])
+                if bbox == coord_placeholder:
+                    cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
+                    continue
                 x1, y1, x2, y2 = bbox
                 if args.version == "v15":
                     y2 = y2 + args.extra_margin
@@ -217,8 +230,9 @@ def main(args):
                 try:
                     res_frame = cv2.resize(res_frame.astype(np.uint8), (x2-x1, y2-y1))
                 except:
+                    cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
                     continue
-                
+
                 # Merge results with version-specific parameters
                 if args.version == "v15":
                     combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
@@ -230,20 +244,20 @@ def main(args):
             temp_vid_path = f"{temp_dir}/temp_{input_basename}_{audio_basename}.mp4"
             cmd_img2video = f"ffmpeg -y -v warning -r {fps} -f image2 -i {result_img_save_path}/%08d.png -vcodec libx264 -vf format=yuv420p -crf 18 {temp_vid_path}"
             print("Video generation command:", cmd_img2video)
-            os.system(cmd_img2video)   
-            
+            os.system(cmd_img2video)
+
             cmd_combine_audio = f"ffmpeg -y -v warning -i {audio_path} -i {temp_vid_path} {output_vid_name}"
-            print("Audio combination command:", cmd_combine_audio) 
+            print("Audio combination command:", cmd_combine_audio)
             os.system(cmd_combine_audio)
-            
+
             # Clean up temporary files
             shutil.rmtree(result_img_save_path)
             os.remove(temp_vid_path)
-            
+
             shutil.rmtree(save_dir_full)
             if not args.saved_coord:
                 os.remove(crop_coord_save_path)
-                    
+
             print(f"Results saved to {output_vid_name}")
         except Exception as e:
             print("Error occurred during processing:", e)
